@@ -1,0 +1,26 @@
+# Production-like run against PostgreSQL:  docker compose up --build
+# Then open http://localhost:8000/docs
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: inventory
+      POSTGRES_DB: inventory
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://inventory:inventory@db:5432/inventory
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
