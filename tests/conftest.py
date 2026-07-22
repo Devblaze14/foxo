@@ -44,8 +44,8 @@ def client(tmp_path):
             db.close()
 
     app.dependency_overrides[get_db] = _override_get_db
-    # No context manager => the app lifespan does not touch the real DB; tables
-    # are created above on the test engine instead.
+    # The tests create tables on their own engine above, so the app lifespan
+    # does not need to run here.
     yield TestClient(app)
 
     app.dependency_overrides.clear()

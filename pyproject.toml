@@ -1,17 +1,8 @@
 [project]
 name = "foxo-inventory-service"
 version = "1.0.0"
-description = "Backend service tracking stock levels and an immutable stock-movement ledger."
+description = "Backend service that tracks stock levels and a log of every stock movement."
 requires-python = ">=3.11"
-
-[tool.ruff]
-line-length = 90
-target-version = "py311"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
-# B008: FastAPI intentionally uses Depends()/Query() as argument defaults.
-ignore = ["B008"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

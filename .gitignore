@@ -1,76 +1,19 @@
-# Byte-compiled / Python cache files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-
-# C extensions / Build & Distribution
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual Environments
 .venv/
 venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# Testing & Coverage
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
-.hypothesis/
-coverage.xml
-*.cover
 
-# Environment variables & secrets
-.env
-.env.*
-!.env.example
-
-# Databases & Logs
+# Local database & env
 *.db
-*.sqlite
 *.sqlite3
-*.log
+.env
 
-# Cache & Temporary files
-.cache/
-*.tmp
-*.bak
-
-# OS generated files
+# OS / editor
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-desktop.ini
-
-# IDEs & Editors
 .idea/
 .vscode/
-*.swp
-*.swo
-*~

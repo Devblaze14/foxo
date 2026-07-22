@@ -1,8 +1,7 @@
 """Application configuration.
 
-Everything is driven by environment variables (12-factor style) so the same
-image runs against SQLite locally and Postgres in Docker/production without a
-code change.
+Settings are read from environment variables, so the same code runs against
+SQLite locally and PostgreSQL in production without any change.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,8 +12,8 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    # SQLite by default => zero-setup local run. Point this at Postgres for
-    # production, e.g. postgresql+psycopg2://user:pass@host:5432/db
+    # SQLite by default so the app runs with no setup. Point this at Postgres
+    # for production, e.g. postgresql+psycopg2://user:pass@host:5432/db
     database_url: str = "sqlite:///./inventory.db"
 
     # Echo SQL to stdout (handy while debugging transactions).
