@@ -3,6 +3,8 @@
 **Live API:** <https://foxo-silk.vercel.app/docs> — deployed on Vercel against
 Supabase Postgres, seeded with 50 products and 205 movements.
 
+**System design reflection:** [answers to both questions](#system-design-questions)
+
 A backend service that tracks how much of each product is in stock and keeps a
 permanent log of every stock movement (restocks, sales, and adjustments).
 
@@ -38,6 +40,29 @@ Bonus requirements (also done):
 - Concurrent updates are handled safely with a version column (optimistic
   locking).
 - A low-stock alert endpoint lists products at or below their reorder point.
+
+Not asked for, but added because the problem needs it:
+
+- **Recording a movement is idempotent.** A terminal that times out and retries
+  cannot accidentally sell the same unit twice.
+
+## Where each requirement lives
+
+| Requirement | Implementation | Test |
+| ----------- | -------------- | ---- |
+| Unique SKU, name, quantity | `models.Product` | `test_duplicate_sku_rejected` |
+| RESTOCK / SALE / ADJUSTMENT | `models.MovementType` | `test_restock_increases_quantity`, `test_sale_decreases_quantity` |
+| ADJUSTMENT requires a reason | `schemas.MovementCreate` | `test_adjustment_requires_reason` |
+| SALE cannot go below zero | `movement_service.record_movement` | `test_sale_below_zero_is_rejected`, `test_sale_to_exactly_zero_is_allowed` |
+| Movement + quantity in one transaction | `movement_service.record_movement` | `test_ledger_invariant_holds_after_many_movements` |
+| Movements never modified or deleted | ORM guards in `models.py` | `test_immutability.py` |
+| Full CRUD for products | `routers/products.py` | `test_products.py` |
+| History, ordered chronologically | `movement_service.list_movements` | `test_history_is_chronological` |
+| *Bonus:* deletion blocked, deactivate instead | `product_service.delete_product` | `test_delete_product_with_movements_is_blocked` |
+| *Bonus:* pagination | `movement_service.list_movements` | `test_pagination_walks_the_whole_history` |
+| *Bonus:* optimistic locking | `version` column, `models.Product` | `test_no_oversell_under_concurrent_sales` |
+| *Bonus:* low-stock alerts | `routers/alerts.py` | `test_pagination_and_alerts.py` |
+| *Extra:* idempotent retries | `client_request_id` + unique index | `test_idempotency.py` |
 
 ## Tech stack
 
@@ -99,6 +124,7 @@ erDiagram
         enum type "RESTOCK, SALE, or ADJUSTMENT"
         int quantity_delta "signed amount"
         string reason "required for ADJUSTMENT"
+        string client_request_id "optional idempotency key, unique"
         int resulting_quantity "stock level after this movement"
         datetime created_at
     }
@@ -176,6 +202,10 @@ a side effect of a cold start. Apply `scripts/schema.sql` once instead.
 | GET | `/alerts/low-stock` | Products at or below their reorder point. |
 | GET | `/health` | Simple health check. |
 
+`POST /products/{id}/movements` accepts an optional `client_request_id`. Sending
+the same key twice returns the original movement instead of recording a second
+one, so a client can safely retry a request that timed out.
+
 Errors come back in a consistent shape with a short code:
 
 ```json
@@ -184,12 +214,12 @@ Errors come back in a consistent shape with a short code:
 
 ## Example requests
 
-Every response below is real output, captured from a run against a fresh
-database. Timestamps are shortened for readability.
+Real output, captured from a run against a fresh database. Timestamps are
+shortened for readability.
 
 **Create a product with opening stock.** The opening quantity is not written
-directly: it is recorded as an `ADJUSTMENT` movement, so the ledger balances
-from the very first row.
+directly: it is recorded as an `ADJUSTMENT` movement, so the ledger balances from
+the very first row.
 
 ```bash
 curl -X POST localhost:8000/products \
@@ -198,39 +228,31 @@ curl -X POST localhost:8000/products \
 ```
 
 ```json
-{
-  "id": 1,
-  "sku": "WIDGET-001",
-  "name": "Blue Widget",
-  "quantity_on_hand": 100,
-  "low_stock_threshold": 20,
-  "is_active": true,
-  "version": 2,
-  "created_at": "2026-07-23T09:14:02Z",
-  "updated_at": "2026-07-23T09:14:02Z"
-}
+{ "id": 1, "sku": "WIDGET-001", "name": "Blue Widget", "quantity_on_hand": 100,
+  "low_stock_threshold": 20, "is_active": true, "version": 2,
+  "created_at": "2026-07-23T09:14:02Z", "updated_at": "2026-07-23T09:14:02Z" }
 ```
 
-**Sell 30 units.** A sale is a negative delta. The response carries
-`resulting_quantity`, the running balance after this movement was applied, so
-the ledger can be audited row by row without replaying the whole history.
+**Record movements.** A sale is a negative delta; an adjustment needs a reason.
+Each response carries `resulting_quantity`, the running balance after that
+movement, so the ledger can be audited row by row.
 
 ```bash
+# Sell 30 units
 curl -X POST localhost:8000/products/1/movements \
   -H 'Content-Type: application/json' \
   -d '{"type":"SALE","quantity_delta":-30}'
+
+# Correct a miscount (a reason is mandatory for an ADJUSTMENT)
+curl -X POST localhost:8000/products/1/movements \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"ADJUSTMENT","quantity_delta":-2,"reason":"Damaged during audit"}'
 ```
 
 ```json
-{
-  "id": 2,
-  "product_id": 1,
-  "type": "SALE",
-  "quantity_delta": -30,
-  "reason": null,
-  "resulting_quantity": 70,
-  "created_at": "2026-07-23T11:47:35Z"
-}
+{ "id": 2, "product_id": 1, "type": "SALE", "quantity_delta": -30,
+  "reason": null, "resulting_quantity": 70, "client_request_id": null,
+  "created_at": "2026-07-23T11:47:35Z" }
 ```
 
 **Try to oversell.** Rejected with `409` before anything is written, so no
@@ -251,31 +273,18 @@ curl -X POST localhost:8000/products/1/movements \
 }
 ```
 
-**Record a correction.** An `ADJUSTMENT` moves stock in either direction, but a
-reason is mandatory; omitting it fails validation with `422`.
+**Retry safely.** Sending the same `client_request_id` twice returns the original
+movement rather than selling the unit again.
 
 ```bash
 curl -X POST localhost:8000/products/1/movements \
   -H 'Content-Type: application/json' \
-  -d '{"type":"ADJUSTMENT","quantity_delta":-2,"reason":"Damaged during audit"}'
+  -d '{"type":"SALE","quantity_delta":-5,"client_request_id":"terminal-04:a1b2c3"}'
 ```
 
-```json
-{
-  "id": 3,
-  "product_id": 1,
-  "type": "ADJUSTMENT",
-  "quantity_delta": -2,
-  "reason": "Damaged during audit",
-  "resulting_quantity": 68,
-  "created_at": "2026-07-23T14:02:19Z"
-}
-```
-
-**View the history**, oldest first, in a paginated envelope. Note that the
-deltas sum to `100 - 30 - 2 = 68`, which is exactly the product's current
-`quantity_on_hand`. That equality is the invariant the whole service exists to
-protect.
+**View the history**, oldest first, in a paginated envelope. The deltas sum to
+`100 - 30 - 2 = 68`, which is exactly the product's `quantity_on_hand`. That
+equality is the invariant the whole service exists to protect.
 
 ```bash
 curl 'localhost:8000/products/1/movements?limit=20&offset=0'
@@ -284,33 +293,12 @@ curl 'localhost:8000/products/1/movements?limit=20&offset=0'
 ```json
 {
   "items": [
-    {
-      "id": 1,
-      "product_id": 1,
-      "type": "ADJUSTMENT",
-      "quantity_delta": 100,
-      "reason": "Opening balance",
-      "resulting_quantity": 100,
-      "created_at": "2026-07-23T09:14:02Z"
-    },
-    {
-      "id": 2,
-      "product_id": 1,
-      "type": "SALE",
-      "quantity_delta": -30,
-      "reason": null,
-      "resulting_quantity": 70,
-      "created_at": "2026-07-23T11:47:35Z"
-    },
-    {
-      "id": 3,
-      "product_id": 1,
-      "type": "ADJUSTMENT",
-      "quantity_delta": -2,
-      "reason": "Damaged during audit",
-      "resulting_quantity": 68,
-      "created_at": "2026-07-23T14:02:19Z"
-    }
+    { "id": 1, "type": "ADJUSTMENT", "quantity_delta": 100,
+      "reason": "Opening balance", "resulting_quantity": 100 },
+    { "id": 2, "type": "SALE", "quantity_delta": -30,
+      "reason": null, "resulting_quantity": 70 },
+    { "id": 3, "type": "ADJUSTMENT", "quantity_delta": -2,
+      "reason": "Damaged during audit", "resulting_quantity": 68 }
   ],
   "total": 3,
   "limit": 20,
@@ -319,11 +307,11 @@ curl 'localhost:8000/products/1/movements?limit=20&offset=0'
 }
 ```
 
-**See what is running low.** Results are ordered most urgent first. Each product
-is compared against its *own* reorder point, which is why a product holding 25
-units appears while others holding far more do not. Products with no threshold
-set, and deactivated products, are excluded entirely. Only the relevant fields
-are shown below; the real response returns full product objects.
+**See what is running low.** Ordered most urgent first. Each product is compared
+against its *own* reorder point, which is why one holding 25 units appears while
+others holding far more do not. Products with no threshold, and deactivated
+products, are excluded. Fields trimmed below; the real response returns full
+product objects.
 
 ```bash
 curl localhost:8000/alerts/low-stock
@@ -368,6 +356,20 @@ simultaneous sales from overselling.
 keeps the never-negative check simple (`quantity + amount >= 0`), makes the total
 a plain sum, and lets an ADJUSTMENT go either way without special handling.
 
+**Retries cannot double-count.** This is the failure the version column does
+*not* protect against. A terminal POSTs a SALE, the connection drops before the
+response arrives, and it has no way to know whether the sale was recorded. If it
+retries, a naive server applies the movement twice: the ledger stays internally
+consistent but is now wrong about the physical world, which is worse than an
+obvious error. Optimistic locking cannot help, because the two requests are
+legitimate sequential writes rather than a race.
+
+The caller sends a stable `client_request_id` instead, and a replay returns the
+original movement without touching stock. The lookup itself can be raced by two
+simultaneous retries, so a unique index on the column is the real guarantee: the
+loser catches the integrity error, rolls back, and returns the winner's row. The
+key is optional, so movements entered by hand still record every time.
+
 **Delete or deactivate.** Deleting a product that has history would throw away
 the audit trail, so it is blocked. Deactivating keeps the record and the history.
 A product with no history can be deleted normally.
@@ -378,10 +380,11 @@ A product with no history can be deleted normally.
 pytest
 ```
 
-The tests cover product CRUD, all three movement types, the never-negative rule,
-immutability of history, pagination, low-stock alerts, and a concurrency test
-that fires many simultaneous sales at one product and checks that stock is never
-oversold and never goes negative.
+31 tests covering product CRUD, all three movement types, the never-negative
+rule, immutability of history, pagination, and low-stock alerts. Two of them are
+worth singling out: a concurrency test that fires many simultaneous sales at one
+product and checks stock is never oversold or negative, and an idempotency test
+that fires ten identical retries and checks exactly one sale lands.
 
 ## System design questions
 
@@ -416,6 +419,17 @@ Two other approaches would also work:
 
 Optimistic locking is a good default here because it is low overhead, holds no
 long locks, and works the same way on SQLite and PostgreSQL.
+
+**A related failure that the version column does not solve.** Suppose one
+terminal sends a SALE, the connection drops before the response comes back, and
+the terminal retries. Those are two legitimate requests arriving one after the
+other, not a race, so the version check passes both times and one physical sale
+is recorded twice. The ledger stays internally consistent while being wrong about
+the warehouse floor, which is harder to notice than an outright error. The fix is
+a different mechanism: the caller attaches a stable `client_request_id`, a unique
+index makes a duplicate impossible to insert, and a replay returns the original
+movement. Both problems look like "the same sale counted twice", but one needs
+locking and the other needs idempotency.
 
 ### 2. How would the design change from one warehouse to 50 warehouses, each with its own stock?
 
@@ -452,24 +466,3 @@ Left out on purpose to keep the project focused:
   a real deployment would use versioned migrations.
 - Multi-warehouse support, as described in question 2 above.
 - A background job or webhook for low-stock alerts instead of a pull endpoint.
-
-## Project structure
-
-```
-app/
-  main.py              FastAPI app, routers, error handlers, health check
-  config.py            settings read from the environment
-  database.py          engine, session, and Base
-  models.py            Product and StockMovement tables, version and immutability rules
-  schemas.py           request and response validation
-  exceptions.py        domain errors mapped to HTTP status and code
-  services/
-    product_service.py   product CRUD, delete or deactivate, low-stock
-    movement_service.py  the transaction that records a movement safely
-  routers/
-    products.py          product endpoints
-    movements.py         movement and history endpoints
-    alerts.py            low-stock endpoint
-tests/                 tests, including immutability and concurrency
-scripts/seed.py        adds sample data
-```
