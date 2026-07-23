@@ -1,5 +1,8 @@
 # Inventory & Stock-Movement Service
 
+**Live API:** <https://foxo-silk.vercel.app/docs> — deployed on Vercel against
+Supabase Postgres, seeded with 50 products and 205 movements.
+
 A backend service that tracks how much of each product is in stock and keeps a
 permanent log of every stock movement (restocks, sales, and adjustments).
 
@@ -121,8 +124,41 @@ nothing else needs to be installed.
 
 The app runs on PostgreSQL without any code change. Set the `DATABASE_URL`
 environment variable to your Postgres connection string and start the server as
-usual. The app creates its tables on startup. A `.env` file works too; see
-`.env.example`.
+usual. A `.env` file works too; see `.env.example`. The seed script populates a
+50-product catalogue with a consistent movement ledger:
+
+```bash
+export DATABASE_URL='postgresql+psycopg://user:pass@host:5432/postgres'
+python -m scripts.seed
+```
+
+It is deterministic and idempotent -- existing SKUs are skipped, so re-running
+it is a no-op. `scripts/schema.sql` creates the same schema by hand if you would
+rather not let the app do it.
+
+### Deployment notes
+
+The live instance runs as a Vercel serverless function against Supabase
+Postgres. Three things that setup requires, all handled in `app/database.py` and
+`app/config.py`:
+
+- **Connect through the pooler, not the direct host.** Supabase's
+  `db.<ref>.supabase.co` endpoint resolves to IPv6 only, and Vercel functions
+  have no IPv6 egress, so a direct connection fails with an opaque
+  `connection is bad` before Postgres ever replies. The Supavisor pooler
+  hostname is dual-stack and works.
+- **`NullPool` for Postgres.** A serverless function is frozen between
+  invocations, so a client-side connection pool just accumulates sockets the
+  runtime has already torn down. The external pooler does the pooling instead.
+- **`prepare_threshold=0`.** Transaction-mode pooling hands each statement a
+  different backend, so server-side prepared statements cannot survive between
+  checkouts. Without this, psycopg fails intermittently with
+  `DuplicatePreparedStatement`.
+
+Table creation is gated behind `AUTO_CREATE_TABLES` (default `true`). It is set
+to `false` in production so an unreachable database cannot take down the whole
+function during startup, and so schema changes are a deliberate act rather than
+a side effect of a cold start. Apply `scripts/schema.sql` once instead.
 
 ## API reference
 
@@ -143,37 +179,162 @@ usual. The app creates its tables on startup. A `.env` file works too; see
 Errors come back in a consistent shape with a short code:
 
 ```json
-{ "error": { "code": "insufficient_stock", "message": "3 on hand, change of -5 would result in -2" } }
+{ "error": { "code": "insufficient_stock", "message": "Rejected: 3 on hand, change of -5 would result in -2" } }
 ```
 
 ## Example requests
 
+Every response below is real output, captured from a run against a fresh
+database. Timestamps are shortened for readability.
+
+**Create a product with opening stock.** The opening quantity is not written
+directly: it is recorded as an `ADJUSTMENT` movement, so the ledger balances
+from the very first row.
+
 ```bash
-# Create a product with 100 units and a reorder point of 20
 curl -X POST localhost:8000/products \
   -H 'Content-Type: application/json' \
   -d '{"sku":"WIDGET-001","name":"Blue Widget","initial_quantity":100,"low_stock_threshold":20}'
+```
 
-# Sell 30 units (a sale uses a negative amount)
+```json
+{
+  "id": 1,
+  "sku": "WIDGET-001",
+  "name": "Blue Widget",
+  "quantity_on_hand": 100,
+  "low_stock_threshold": 20,
+  "is_active": true,
+  "version": 2,
+  "created_at": "2026-07-23T09:14:02Z",
+  "updated_at": "2026-07-23T09:14:02Z"
+}
+```
+
+**Sell 30 units.** A sale is a negative delta. The response carries
+`resulting_quantity`, the running balance after this movement was applied, so
+the ledger can be audited row by row without replaying the whole history.
+
+```bash
 curl -X POST localhost:8000/products/1/movements \
   -H 'Content-Type: application/json' \
   -d '{"type":"SALE","quantity_delta":-30}'
+```
 
-# Try to oversell, which returns 409 insufficient_stock
+```json
+{
+  "id": 2,
+  "product_id": 1,
+  "type": "SALE",
+  "quantity_delta": -30,
+  "reason": null,
+  "resulting_quantity": 70,
+  "created_at": "2026-07-23T11:47:35Z"
+}
+```
+
+**Try to oversell.** Rejected with `409` before anything is written, so no
+partial state is left behind and the quantity is untouched.
+
+```bash
 curl -X POST localhost:8000/products/1/movements \
   -H 'Content-Type: application/json' \
   -d '{"type":"SALE","quantity_delta":-9999}'
+```
 
-# Record a correction (a reason is required for an ADJUSTMENT)
+```json
+{
+  "error": {
+    "code": "insufficient_stock",
+    "message": "Rejected: 70 on hand, change of -9999 would result in -9929"
+  }
+}
+```
+
+**Record a correction.** An `ADJUSTMENT` moves stock in either direction, but a
+reason is mandatory; omitting it fails validation with `422`.
+
+```bash
 curl -X POST localhost:8000/products/1/movements \
   -H 'Content-Type: application/json' \
   -d '{"type":"ADJUSTMENT","quantity_delta":-2,"reason":"Damaged during audit"}'
+```
 
-# View history (oldest first)
+```json
+{
+  "id": 3,
+  "product_id": 1,
+  "type": "ADJUSTMENT",
+  "quantity_delta": -2,
+  "reason": "Damaged during audit",
+  "resulting_quantity": 68,
+  "created_at": "2026-07-23T14:02:19Z"
+}
+```
+
+**View the history**, oldest first, in a paginated envelope. Note that the
+deltas sum to `100 - 30 - 2 = 68`, which is exactly the product's current
+`quantity_on_hand`. That equality is the invariant the whole service exists to
+protect.
+
+```bash
 curl 'localhost:8000/products/1/movements?limit=20&offset=0'
+```
 
-# See what is running low
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "product_id": 1,
+      "type": "ADJUSTMENT",
+      "quantity_delta": 100,
+      "reason": "Opening balance",
+      "resulting_quantity": 100,
+      "created_at": "2026-07-23T09:14:02Z"
+    },
+    {
+      "id": 2,
+      "product_id": 1,
+      "type": "SALE",
+      "quantity_delta": -30,
+      "reason": null,
+      "resulting_quantity": 70,
+      "created_at": "2026-07-23T11:47:35Z"
+    },
+    {
+      "id": 3,
+      "product_id": 1,
+      "type": "ADJUSTMENT",
+      "quantity_delta": -2,
+      "reason": "Damaged during audit",
+      "resulting_quantity": 68,
+      "created_at": "2026-07-23T14:02:19Z"
+    }
+  ],
+  "total": 3,
+  "limit": 20,
+  "offset": 0,
+  "has_more": false
+}
+```
+
+**See what is running low.** Results are ordered most urgent first. Each product
+is compared against its *own* reorder point, which is why a product holding 25
+units appears while others holding far more do not. Products with no threshold
+set, and deactivated products, are excluded entirely. Only the relevant fields
+are shown below; the real response returns full product objects.
+
+```bash
 curl localhost:8000/alerts/low-stock
+```
+
+```json
+[
+  { "sku": "WGT-004", "quantity_on_hand": 0,  "low_stock_threshold": 20 },
+  { "sku": "SEA-004", "quantity_on_hand": 3,  "low_stock_threshold": 25 },
+  { "sku": "WGT-002", "quantity_on_hand": 25, "low_stock_threshold": 50 }
+]
 ```
 
 ## Design decisions
