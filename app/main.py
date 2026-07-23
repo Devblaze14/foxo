@@ -6,6 +6,7 @@ consistent JSON error envelope:
     {"error": {"code": "insufficient_stock", "message": "..."}}
 """
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -18,11 +19,17 @@ from app.exceptions import AppError
 from app.routers import alerts, movements, products
 
 
+# Creating tables at import/startup time is fine for a local run, but on a
+# serverless platform it runs on every cold start and, worse, an unreachable
+# database takes the whole function down with a 500 instead of one bad request.
+# Set AUTO_CREATE_TABLES=false in production and apply scripts/schema.sql once.
+AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Simple auto-create for the take-home. In production this is replaced by
-    # Alembic migrations (see README "Future improvements").
-    Base.metadata.create_all(bind=engine)
+    if AUTO_CREATE_TABLES:
+        Base.metadata.create_all(bind=engine)
     yield
 
 
